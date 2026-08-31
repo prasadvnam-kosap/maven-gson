@@ -1,0 +1,140 @@
+# LOADED capture — maven-gson. THE REPOSITORY THAT PROVED THE CANARY WAS NECESSARY.
+#
+# gson/pom.xml sets <argLine> inside its Surefire block, which overrides -DargLine entirely.
+# The 2026-08-29 attempt ran 118 test classes green, exit 0, and produced ZERO trace lines. That
+# is why this harness uses JAVA_TOOL_OPTIONS (which cannot be overridden that way) and why every
+# capture carries a canary.
+#
+# ONE ARM ONLY. gson is a library with no application context, so the two-arm petclinic design
+# has nothing to isolate. Stated in the run rather than left as a silently missing directory.
+#
+# Recorded figure to reproduce: 25.0% informative, all scopes, 2026-08-29 -- but under the rule
+# settled 2026-08-31 (real shipped code only) it must be recomputed, not carried over.
+
+name: LOADED capture — gson
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit or branch to measure. Defaults to the corpus pin. A fork's DEFAULT branch tracks
+          upstream's head, not our SHA, so measuring the default branch measures different code
+          than corpus.yaml claims — and the number would silently not be comparable to CS-7.
+        required: false
+        default: 'depproof-pinned'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest          # declared by the repo. Do not "improve" this.
+    steps:
+      # The workflow lives on the DEFAULT branch (GitHub only offers Run workflow there) but
+      # measures the PIN. Same split as templates/depproof-fork.yml.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JDK 17 (temurin, as build.yml declares)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'   # build.yml declares temurin, matrix [11,17,21,25]
+          cache: maven
+
+      # Build once, untraced. Compilation loads the compiler's own dependencies and none of the
+      # application's, so tracing it would add noise with no signal.
+      - name: Build (untraced)
+        run: mvn -B --no-transfer-progress -DskipTests install
+
+      # ---------------------------------------------------------------- arm A: the full suite
+      # Docker is preinstalled on ubuntu-latest, so spring.docker.compose starts the postgres
+      # service from the repo's own compose file and PostgresIntegrationTests boots for real.
+      - name: Arm A — full suite, application context boots
+        env:
+          JAVA_TOOL_OPTIONS: -Xlog:class+load=info:file=${{ github.workspace }}/traces/full/trace-%p.log
+        run: |
+          mkdir -p traces/full
+          mvn -B --no-transfer-progress verify || echo "suite exited $? — a partial suite still yields a valid trace"
+
+      # Copy arm A's reports out, THEN delete them. Surefire does not clean the report
+      # directory, and `mvn test` only rewrites the classes it actually runs -- so without this
+      # delete, arm B's results directory keeps arm A's XML for every class arm B excluded and
+      # the arm B denominator silently claims those suites ran. Found on the first real run:
+      # both arms reported "73 tests, 0 failures" when arm B had run 63.
+      - name: Preserve arm A results, then clear them for arm B
+        run: |
+          mkdir -p results/full
+          find . -path '*/surefire-reports/TEST-*.xml' -exec cp {} results/full/ \; 2>/dev/null || true
+          find . -type d -name surefire-reports -exec rm -rf {} + 2>/dev/null || true
+
+      # ---------------------------------------------------------- arm B: no application context
+      # The ONLY difference from arm A. Every excluded class boots a Spring context; the rest are
+      # plain unit tests. If the never-loaded share barely moves, the app-context hypothesis is
+      # dead and test count is an adequate denominator after all.
+      - name: Arm B — unit tests only, no application context
+        env:
+          JAVA_TOOL_OPTIONS: -Xlog:class+load=info:file=${{ github.workspace }}/traces/unit/trace-%p.log
+        run: |
+          mkdir -p traces/unit
+          echo "gson is a LIBRARY: it has no application context to boot, so there is no arm B."
+          echo "The two-arm design exists to isolate context boots and does not apply here."
+          echo "Recorded explicitly rather than silently producing an identical second arm."
+
+      - name: Preserve arm B results
+        run: echo 'no arm B for a library'
+
+      # ------------------------------------------------------------------------------- canary
+      # CS-8 #1, and the reason this step exists at all: gson ran 118 test classes green with
+      # exit 0 and produced ZERO trace lines, because its pom overrides <argLine>. A harness that
+      # trusted the exit code would have reported "nothing loaded" -- 100% never-loaded. Fail the
+      # job here rather than let an empty trace become a percentage in a table.
+      - name: Canary — the tracer actually attached
+        run: |
+          for arm in full; do
+            n=$(cat traces/$arm/*.log 2>/dev/null | grep -c 'class,load' || true)
+            echo "$arm: $n class-load lines across $(ls traces/$arm 2>/dev/null | wc -l) process traces"
+            if [ "${n:-0}" -lt 1000 ]; then
+              echo "::error::arm $arm produced $n class-load lines. The tracer did not attach."
+              exit 1
+            fi
+          done
+
+      # The PRIMARY denominator (decided 2026-08-31): depproof's own resolved set, because that
+      # is what the shipped LOADED axis would annotate.
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
+      - name: Resolved set — depproof SBOM
+        if: always()
+        run: |
+          mkdir -p sbom
+          docker run --rm -v "$PWD:/w" -w /w ghcr.io/depproof/depproof:v0 \
+            scan --discover --output-dir sbom || true
+          ls -la sbom/
+
+      # The CROSS-CHECK denominator: Maven's own view. A divergence is a fidelity measurement,
+      # not a nuisance, so it is captured rather than reconciled away.
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
+      - name: Cross-check — Maven's resolved list
+        if: always()
+        run: |
+          mvn -B dependency:list -DoutputFile=$PWD/maven-resolved.txt -DappendOutput=true || true
+
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loaded-gson
+          path: |
+            traces/
+            results/
+            sbom/
+            maven-resolved.txt
+          retention-days: 14
